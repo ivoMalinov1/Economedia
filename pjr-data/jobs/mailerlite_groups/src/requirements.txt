@@ -1,0 +1,5 @@
+simple-salesforce
+pandas
+pandas_gbq
+requests==2.31.0
+types-requests==2.31.0.2

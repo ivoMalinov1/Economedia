@@ -1,0 +1,157 @@
+# Add sh to your path as described here https://github.com/casey/just/blob/master/README.md#prerequisites
+# The sh shell is probably a much easier solution compatibility-wise
+set windows-shell := ["sh.exe", "-c"]
+VENV := justfile_directory() + '/venv'
+VENV_BIN := justfile_directory() + if os() == "windows" {'/venv/Scripts'} else {'/venv/bin'}
+SOURCE := './src'
+TF := justfile_directory() + '/tf'
+BUILD_DIR := justfile_directory() + '/build'
+PYTHON := if os() == "windows" { "py" } else { "python3" }
+EXPECTED_PYTHON_VERSION := "3.11"
+CURRENT_PYTHON_VERSION := if os() == "windows" { `py --version` } else { `python3 --version` }
+PYTHON_VALIDATION_REGEX := EXPECTED_PYTHON_VERSION + '.+'
+IS_CORRECT_PYTHON_VERSION := if CURRENT_PYTHON_VERSION =~ PYTHON_VALIDATION_REGEX {"true"} else {"false"}
+PIPELINE_NAME := "data_transfer"
+LOCAL_DOCKERFILE_PATH := justfile_directory() + "/../../shared/pipelines/Dockerfile"
+REGION := "europe-west3"
+
+@default:
+  just --list
+
+@_check_python_version:
+  echo {{ if IS_CORRECT_PYTHON_VERSION == "true" { "Initializing.." } else { "Incorrect Python version " + CURRENT_PYTHON_VERSION + "! Expected: " + EXPECTED_PYTHON_VERSION } }}
+  echo {{ if IS_CORRECT_PYTHON_VERSION == "true" {""} else {error("")} }}
+
+@init: _check_python_version
+  just install
+
+initenv:
+  @echo 'Creating virtual environment!'
+  @{{PYTHON}} -m venv "{{VENV}}"
+
+install: initenv
+  "{{VENV_BIN}}/pip" install -r "{{SOURCE}}/requirements-dev.txt"
+
+@flake8:
+  cd "{{SOURCE}}" && "{{VENV_BIN}}/flake8" .
+  echo "flake8: OK ✅"
+
+@mypy:
+  cd "{{SOURCE}}" && "{{VENV_BIN}}/mypy" .
+  echo "mypy: OK ✅"
+
+@test:
+  cd "{{SOURCE}}" && "{{VENV_BIN}}/pytest" .
+  echo "tests: OK ✅"
+
+@lint:
+  just flake8
+  just mypy
+
+@clean:
+  echo "Removing virtual environment..."
+  rm -rf "{{VENV}}"
+  echo "Removing build folder..."
+  rm -rf "{{BUILD_DIR}}"
+  echo "Environment cleaned ✅"
+
+@build DOCKERFILE_PATH=LOCAL_DOCKERFILE_PATH LOCAL_TAG="latest":
+  docker build . -f {{DOCKERFILE_PATH}} -t {{PIPELINE_NAME}}:{{LOCAL_TAG}} --build-arg source_path={{SOURCE}}
+
+@_terraform_setup ENVIRONMENT:
+  cd "{{TF}}" && terraform init -input=false
+  cd "{{TF}}" && terraform workspace new "{{ENVIRONMENT}}" || true
+  cd "{{TF}}" && terraform workspace select "{{ENVIRONMENT}}"
+
+@plan ENVIRONMENT="economedia-data-dev-zwym" OUTPLAN="deploy-tfplan":
+  just _terraform_setup "{{ENVIRONMENT}}"
+  cd "{{TF}}" && terraform plan -lock=false -out="{{ENVIRONMENT}}-{{PIPELINE_NAME}}-{{OUTPLAN}}"
+
+@deploy ENVIRONMENT="economedia-data-dev-zwym":
+  just _terraform_setup "{{ENVIRONMENT}}"
+  cd "{{TF}}" && terraform apply -auto-approve
+
+DOCKER_RUNNING := `docker info &> /dev/null; echo $?`
+
+@_check_docker_is_running:
+  # Utility to check if Docker is up and running
+  echo {{ if DOCKER_RUNNING == "0" {"Docker found!"} else {error("Docker is required for this command. Please run Docker and try again.")} }}
+
+GCLOUD_INSTALLED := `gcloud --version &> /dev/null; echo $?`
+
+@_check_gcloud_is_installed:
+  # Utility to check if gcloud cli is installed
+  echo {{ if GCLOUD_INSTALLED == "0" {"GCloud found!"} else {error("Gcloud CLI is required for this command. Please install and try again.")} }}
+
+@_setup_deploy LOCAL_TAG="0.0.1":
+  # Sets up the deployment process by checking if the image about to be pushed exists as well as adding repo to docker
+  echo "Checking if local image exists {{PIPELINE_NAME}}:{{LOCAL_TAG}}"
+  docker image inspect --format="Image exists" {{PIPELINE_NAME}}:{{LOCAL_TAG}}
+
+  echo "Adding Docker configuration for Artifact Registry"
+  gcloud auth configure-docker {{REGION}}-docker.pkg.dev
+
+@_run_setup LOCAL_TAG:
+  # Utility to run all setup steps
+  just _check_gcloud_is_installed
+  just _check_docker_is_running
+  just _setup_deploy "{{LOCAL_TAG}}"
+
+@deploy_dataflow_template ENVIRONMENT="economedia-data-dev-zwym" LOCAL_TAG="latest": (_setup_deploy LOCAL_TAG)
+  #!/usr/bin/env bash
+  # Checks the current branch and if there are changes to it regarding the template and if so runs the deploy
+  if [[ $(git branch --show-current) == "main" ]]; then
+    git diff --quiet main~1 main -- .;
+  else
+    git diff --quiet HEAD main -- .;
+  fi
+
+  has_changed=$?
+
+  if [[ ${has_changed} -eq 0 ]]; then
+    echo "No changes found in pipeline folder. Skipping Dataflow deploy.";
+  else
+    echo "Changes found. Redeploying Dataflow template";
+    just _deploy_template "{{LOCAL_TAG}}" "{{ENVIRONMENT}}";
+  fi
+
+@_push_image LOCAL_NAME LOCAL_TAG REMOTE_NAME REMOTE_TAG:
+  # Tags and pushes a local image to a remote repository
+  echo "Pushing image {{LOCAL_NAME}}:{{LOCAL_TAG}} to {{REMOTE_NAME}}:{{REMOTE_TAG}}"
+  docker tag {{LOCAL_NAME}}:{{LOCAL_TAG}} {{REMOTE_NAME}}:{{REMOTE_TAG}}
+  docker push {{REMOTE_NAME}}:{{REMOTE_TAG}}
+
+@_upload_json_template TAG ENVIRONMENT="economedia-data-dev-zwym":
+  # Builds and uploads the json tempalte from the image with the specified tag
+  gcloud dataflow flex-template build gs://dataflow_flex_templates_{{ENVIRONMENT}}/{{PIPELINE_NAME}}-{{TAG}}.json \
+     --image "{{REGION}}-docker.pkg.dev/{{ENVIRONMENT}}/dataflow-templates/{{PIPELINE_NAME}}:{{TAG}}" \
+     --sdk-language "PYTHON" \
+     --metadata-file "metadata.json" \
+     --project "{{ENVIRONMENT}}"
+
+@test_integration:
+  # Placeholder for an integration test step. TODO: Implement this
+  sleep 5
+
+CURRENT_REV := `echo r$(git rev-list --count HEAD).$(git rev-parse --short=7 HEAD)`
+
+@_deploy_template LOCAL_TAG="latest" ENVIRONMENT="economedia-data-dev-zwym":
+   # Orchestrates the deployment by:
+   # 1. Pushes a local image with staging and current revision tags
+   # 2. Uploads dataflow template definitions for both of those images
+   # 3. Runs integration tests using the specified staging image
+   # 4. If integration test step doesnt fail - tags the image with latest and pushes it with the corresponding latest template
+   just _push_image "{{PIPELINE_NAME}}" "{{LOCAL_TAG}}" "europe-west3-docker.pkg.dev/{{ENVIRONMENT}}/dataflow-templates/{{PIPELINE_NAME}}" staging
+   just _push_image "{{PIPELINE_NAME}}" "{{LOCAL_TAG}}" "europe-west3-docker.pkg.dev/{{ENVIRONMENT}}/dataflow-templates/{{PIPELINE_NAME}}" {{CURRENT_REV}}
+
+   just _upload_json_template staging "{{ENVIRONMENT}}"
+   just _upload_json_template "{{CURRENT_REV}}" "{{ENVIRONMENT}}"
+
+   just test_integration
+
+   just _push_image "{{PIPELINE_NAME}}" "{{LOCAL_TAG}}" "europe-west3-docker.pkg.dev/{{ENVIRONMENT}}/dataflow-templates/{{PIPELINE_NAME}}" latest
+   just _upload_json_template latest "{{ENVIRONMENT}}"
+
+@_develop:
+  "{{VENV_BIN}}/python" -m ipykernel install --user --name venv --display-name "venv"
+  "{{VENV_BIN}}/jupyter" notebook
